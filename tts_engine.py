@@ -1,10 +1,12 @@
+%%writefile /kaggle/working/TTS_SYSTEM/tts_engine.py
 import os
 import re
 import time
+import uuid
 import threading
 import torch
-import torchaudio
 from TTS.api import TTS
+from pydub import AudioSegment
 
 os.environ["COQUI_TOS_AGREED"] = "1"
 os.environ["MPLBACKEND"] = "Agg"
@@ -14,42 +16,19 @@ from audio_utils import get_cache_key, get_cached_path, is_cached
 
 
 def normalize_text_for_tts(text: str) -> str:
-    """
-    Robust Normalization: Removes unsupported special characters, extra spaces,
-    and weird symbols that cause XTTS to hallucinate gibberish at pauses.
-    """
     if not text:
         return text
-
-    # Strip and convert all kinds of whitespace/tabs/newlines to a standard space
     text = text.strip()
-    text = re.sub(r"[\r\n\t]+", " ", text)
-    
-    # Clean non-standard/unusual unicode punctuation symbols that confuse XTTS
-    # Convert Devanagari Danda '।' to standard period '.' for clean XTTS processing
-    text = text.replace("।", ".")
-    
-    # Remove weird symbols/characters (Keep letters, numbers, basic punctuation, Hindi script)
-    # Allows Hindi (u0900-u097F), English (a-zA-A0-9), and basic punctuation (. , ! ? - ')
-    text = re.sub(r"[^\w\s.,!?'\u0900-\u097F]", "", text)
-
-    # Replace multiple dots/dashes/symbols like "..." or "---" or ",," with single punctuation
-    text = re.sub(r"\.{2,}", ".", text)
-    text = re.sub(r"-{2,}", "-", text)
-    text = re.sub(r",{2,}", ",", text)
-
-    # Fix space around punctuation (e.g. "अच्छा .तकनीक" -> "अच्छा. तकनीक")
-    text = re.sub(r"\s+([.,!?])", r"\1", text)
-    text = re.sub(r"([.,!?])([^\s])", r"\1 \2", text)
-
-    # Collapse multiple spaces into one space
-    text = re.sub(r"\s+", " ", text).strip()
-
-    # Ensure sentence ends with a proper terminator
-    if text and text[-1] not in ".!?":
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"([,.!?;:।])(\S)", r"\1 \2", text)
+    if text and text[-1] not in ".!?।":
         text += "."
-
     return text
+
+
+def split_into_sentences(text: str) -> list[str]:
+    sentences = re.split(r"(?<=[.!?।])\s+", text)
+    return [s.strip() for s in sentences if s.strip()]
 
 
 class TTSEngine:
@@ -57,7 +36,14 @@ class TTSEngine:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.model = None
         self.lock = threading.Lock()
-        self.builtin_speakers = {}  # {"builtin_claribel_dervla": "Claribel Dervla", ...}
+        self.builtin_speakers = {}
+
+        self.temperature = 0.65
+        self.repetition_penalty = 5.0
+        self.top_k = 50
+        self.top_p = 0.85
+        self.length_penalty = 1.0
+        self.speed = 1.0
 
     def load(self):
         if self.model is not None:
@@ -67,10 +53,8 @@ class TTSEngine:
         print("[TTSEngine] Model loaded successfully.")
 
         if self.device == "cpu":
-            print("⚠️ [TTSEngine] WARNING: Running on CPU. Generation will be slow. "
-                  "Enable GPU runtime in Colab (Runtime > Change runtime type > T4 GPU).")
+            print("⚠️ [TTSEngine] WARNING: Running on CPU. Generation will be slow.")
 
-        # Built-in XTTS speakers mapping
         raw_speakers = getattr(self.model, "speakers", None) or []
         for name in raw_speakers:
             key = "builtin_" + name.lower().replace(" ", "_")
@@ -81,6 +65,24 @@ class TTSEngine:
     def is_builtin_voice(self, voice_id: str) -> bool:
         return voice_id in self.builtin_speakers
 
+    def _generate_segment(self, text, language, file_path, speaker_wav=None, speaker_name=None):
+        common_args = dict(
+            text=text,
+            language=language,
+            file_path=str(file_path),
+            split_sentences=False,
+            temperature=self.temperature,
+            repetition_penalty=self.repetition_penalty,
+            top_k=self.top_k,
+            top_p=self.top_p,
+            length_penalty=self.length_penalty,
+            speed=self.speed,
+        )
+        if speaker_name:
+            self.model.tts_to_file(speaker=speaker_name, **common_args)
+        else:
+            self.model.tts_to_file(speaker_wav=speaker_wav, **common_args)
+
     def generate(
         self,
         text: str,
@@ -89,23 +91,19 @@ class TTSEngine:
         speaker_wav: str = None,
         speaker_name: str = None,
     ) -> dict:
-        """
-        Generates natural, crisp audio without gibberish or hallucination at symbols/spaces.
-        """
         if self.model is None:
             raise RuntimeError("XTTS model is not loaded.")
         if not speaker_wav and not speaker_name:
             raise ValueError("Either speaker_wav or speaker_name must be provided.")
 
-        # 1. Clean & normalize text to kill bad symbols/spaces
         text = normalize_text_for_tts(text)
         if not text:
             raise ValueError("Text is empty after normalization.")
 
-        # 2. Check Cache
         cache_key = get_cache_key(text, voice_id, language)
         cached_file = get_cached_path(cache_key)
 
+        # --- Cache check ---
         if is_cached(cache_key):
             print(f"[TTSEngine] Cache Hit! Serving cached file: {cached_file}")
             return {
@@ -116,61 +114,50 @@ class TTSEngine:
             }
 
         start = time.time()
-        final_path = str(cached_file)
+        sentences = split_into_sentences(text)
 
-        # 3. Enhanced Generation Logic
+        # --- IMPORTANT FIX: Har request ko apna UNIQUE temp file milta hai
+        # (request-specific uuid ke saath) — taaki koi bhi do requests kabhi
+        # ek dusre ki file ko overwrite/partial-read na kar sakein. Poora
+        # generation complete hone ke BAAD hi hum final cache path pe
+        # atomically rename karte hain — isliye reader ko kabhi bhi
+        # incomplete/stale/wrong-voice ki audio nahi milegi. ---
+        request_temp_path = OUTPUT_DIR / f"pending_{voice_id}_{uuid.uuid4().hex}.wav"
+
         with self.lock:
-            gpt_cond_kwargs = {
-                "temperature": 0.45,           # Lower temp stops hallucinating sound at pauses
-                "repetition_penalty": 8.0,     # High penalty prevents repeating sounds at spaces
-                "speed": 1.05,                 # Natural speech pace
-                "top_p": 0.8,
-                "top_k": 40,                   # Focused token prediction
-                "length_penalty": 1.0,
-                "enable_text_splitting": True
-            }
+            if len(sentences) <= 1:
+                self._generate_segment(text, language, request_temp_path, speaker_wav, speaker_name)
+            else:
+                segment_paths = []
+                for i, sentence in enumerate(sentences):
+                    seg_path = OUTPUT_DIR / f"seg_{voice_id}_{uuid.uuid4().hex}_{i}.wav"
+                    self._generate_segment(sentence, language, seg_path, speaker_wav, speaker_name)
+                    segment_paths.append(str(seg_path))
 
-            try:
-                # Custom inference logic
-                wav_outputs = self.model.synthesizer.tts(
-                    text=text,
-                    language_name=language,
-                    speaker_name=speaker_name,
-                    speaker_wav=speaker_wav,
-                    split_sentences=True,
-                    gpt_cond_len=10,            # Clean sound matching
-                    **gpt_cond_kwargs
-                )
+                combined = AudioSegment.empty()
+                pause = AudioSegment.silent(duration=250)
+                for i, seg_path in enumerate(segment_paths):
+                    combined += AudioSegment.from_wav(seg_path)
+                    if i < len(segment_paths) - 1:
+                        combined += pause
 
-                wav_tensor = torch.tensor(wav_outputs).unsqueeze(0)
+                combined.export(str(request_temp_path), format="wav")
 
-                # Silence & Hallucination Trimmer
-                non_silent_indices = torch.abs(wav_tensor) > 0.01
-                if non_silent_indices.any():
-                    last_sound = torch.max(torch.where(non_silent_indices)[2])
-                    cutoff = min(last_sound + int(24000 * 0.15), wav_tensor.shape[2])
-                    wav_tensor = wav_tensor[:, :, :cutoff]
+                for seg_path in segment_paths:
+                    if os.path.exists(seg_path):
+                        os.remove(seg_path)
 
-                torchaudio.save(final_path, wav_tensor, 24000)
-
-            except Exception as e:
-                print(f"⚠️ Direct synthesis fallback triggered ({e})...")
-                common_args = dict(
-                    text=text,
-                    language=language,
-                    file_path=final_path,
-                    split_sentences=True,
-                )
-                if speaker_name:
-                    self.model.tts_to_file(speaker=speaker_name, **common_args)
-                else:
-                    self.model.tts_to_file(speaker_wav=speaker_wav, **common_args)
+            # --- Atomic rename: sirf tabhi cache file banti hai jab poora
+            # generation successfully complete ho chuka ho. os.replace()
+            # atomic operation hai — koi bhi reader kabhi partial file
+            # nahi dekhega. ---
+            os.replace(str(request_temp_path), str(cached_file))
 
         elapsed = round(time.time() - start, 2)
-        print(f"[TTSEngine] Speech Generated in {elapsed}s")
+        print(f"[TTSEngine] Speech Generated in {elapsed}s ({len(sentences)} sentence(s)) for voice_id={voice_id}")
 
         return {
-            "path": final_path,
+            "path": str(cached_file),
             "cache_key": cache_key,
             "time_seconds": elapsed,
             "is_cached": False,
