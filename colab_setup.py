@@ -6,7 +6,7 @@ Colab me is script ko chalao — yeh:
 4. Health check karke confirm karega sab sahi chal raha hai
 
 Usage (Colab cell me):
-    !/content/tts_env/bin/python colab_setup.py
+    !python colab_setup.py
 """
 import os
 import sys
@@ -30,16 +30,14 @@ def start():
     print(f"PUBLIC API URL: {public_url}")
     print(f"{'='*60}\n")
 
-    # IMPORTANT: sirf "uvicorn" likhne se system-wide (global) uvicorn use ho sakta hai,
-    # jo isi venv me nahi hai. Isliye hamesha isi venv ke uvicorn ka poora path use karo —
-    # yeh path automatically usi Python interpreter se nikalte hain jisse yeh script chal rahi hai.
-    venv_bin_dir = os.path.dirname(sys.executable)
-    uvicorn_path = os.path.join(venv_bin_dir, "uvicorn")
-
-    print(f"Starting FastAPI server via: {uvicorn_path}")
+    # Colab me alag venv nahi hota, isliye seedha "python -m uvicorn" use karo.
+    # sys.executable wahi python interpreter hai jisse yeh script chal rahi hai,
+    # isliye uvicorn usi environment me milega jaha install hua tha — path dhundne
+    # ki zaroorat nahi, isse FileNotFoundError wali problem bhi nahi aayegi.
+    print(f"Starting FastAPI server via: {sys.executable} -m uvicorn")
     print("(model load hone me 1-2 min lagega)")
     process = subprocess.Popen(
-        [uvicorn_path, "main:app", "--host", "0.0.0.0", "--port", "8006"],
+        [sys.executable, "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8006"],
         env={**os.environ, "MPLBACKEND": "Agg"}
     )
 
