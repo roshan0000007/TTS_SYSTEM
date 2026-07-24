@@ -1,4 +1,3 @@
-%%writefile /kaggle/working/TTS_SYSTEM/tts_engine.py
 import os
 import re
 import time

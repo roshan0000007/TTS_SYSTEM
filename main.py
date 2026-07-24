@@ -1,4 +1,3 @@
-
 """
 Main FastAPI application for XTTS-v2 TTS system.
 
@@ -42,7 +41,7 @@ from database import (
     GenerationHistory,
 )
 from tts_engine import engine
-from audio_utils import prepare_reference_audio
+from audio_utils import prepare_reference_audio, is_supported_audio_format, ALLOWED_AUDIO_EXTENSIONS
 
 
 # ============================================================
@@ -55,15 +54,12 @@ async def lifespan(app: FastAPI):
     print("Starting TTS Application")
     print("======================================")
 
-    # Initialize DB schema
     init_db()
 
-    # Ensure audio storage directory exists
     VOICES_DIR.mkdir(parents=True, exist_ok=True)
 
     print(f"[Startup] Voices directory: {VOICES_DIR}")
 
-    # Load XTTS model state once
     engine.load()
 
     print(f"[Startup] Model loaded: {engine.model is not None}")
@@ -98,8 +94,9 @@ def add_voice(
     db: Session = Depends(get_db),
 ):
     """
-    Upload reference audio, convert to optimal sample settings (22.05kHz mono WAV),
-    and store record in the database.
+    Upload reference audio (mp3, wav, m4a, ogg, flac — koi bhi format chalega),
+    automatically clean 22.05kHz mono WAV mein convert karta hai, silence-aware
+    trimming karta hai, aur DB mein record store karta hai.
     """
     if not voice_sample.filename:
         raise HTTPException(
@@ -107,14 +104,24 @@ def add_voice(
             detail="Voice sample file is required."
         )
 
-    # Generate explicit unique ID upfront to avoid flush dependency issues
+    if not is_supported_audio_format(voice_sample.filename):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Unsupported file format: '{voice_sample.filename}'. "
+                f"Supported formats: {', '.join(sorted(ALLOWED_AUDIO_EXTENSIONS))}"
+            )
+        )
+
     voice_id = f"voice_{uuid.uuid4().hex[:10]}"
 
-    raw_sample_path = VOICES_DIR / f"raw_{voice_id}.wav"
+    original_ext = os.path.splitext(voice_sample.filename)[1].lower()
+    raw_sample_path = VOICES_DIR / f"raw_{voice_id}{original_ext}"
     clean_sample_path = VOICES_DIR / f"{voice_id}.wav"
 
+    conversion_info = {}
+
     try:
-        # 1. Save uploaded file temporarily
         with open(raw_sample_path, "wb") as buffer:
             shutil.copyfileobj(voice_sample.file, buffer)
 
@@ -124,10 +131,8 @@ def add_voice(
                 detail="Uploaded audio sample is empty or corrupt."
             )
 
-        # 2. Convert and preprocess reference audio for optimal XTTS cloning accuracy
-        prepare_reference_audio(str(raw_sample_path), str(clean_sample_path))
+        conversion_info = prepare_reference_audio(str(raw_sample_path), str(clean_sample_path))
 
-        # 3. DB Insertion
         voice = Voice(
             id=voice_id,
             name=name,
@@ -139,20 +144,29 @@ def add_voice(
         db.commit()
         db.refresh(voice)
 
-    except Exception as e:
+    except ValueError as e:
         db.rollback()
-        # Clean up files on error
         if raw_sample_path.exists():
             raw_sample_path.unlink()
         if clean_sample_path.exists():
             clean_sample_path.unlink()
-
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        if raw_sample_path.exists():
+            raw_sample_path.unlink()
+        if clean_sample_path.exists():
+            clean_sample_path.unlink()
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to add voice: {str(e)}"
         )
     finally:
-        # Always remove temporary raw input file
         if raw_sample_path.exists():
             raw_sample_path.unlink()
 
@@ -160,6 +174,9 @@ def add_voice(
     print(f"Voice ID: {voice.id}")
     print(f"Name: {voice.name}")
     print(f"Language: {voice.language}")
+    print(f"Original format: {original_ext}")
+    print(f"Duration: {conversion_info.get('original_duration_seconds')}s -> {conversion_info.get('final_duration_seconds')}s")
+    print(f"Trimmed: {conversion_info.get('was_trimmed')}")
     print(f"Sample path: {voice.sample_path}")
 
     return {
@@ -169,6 +186,7 @@ def add_voice(
         "language": voice.language,
         "sample_path": voice.sample_path,
         "file_exists": os.path.exists(voice.sample_path),
+        "conversion_info": conversion_info,
     }
 
 
@@ -272,14 +290,12 @@ def delete_voice(voice_id: str, db: Session = Depends(get_db)):
             detail="Voice not found."
         )
 
-    # Delete audio file from storage if present
     if voice.sample_path and os.path.exists(voice.sample_path):
         try:
             os.remove(voice.sample_path)
         except OSError as e:
             print(f"[Warning] Failed to delete file {voice.sample_path}: {e}")
 
-    # Delete record from database
     db.delete(voice)
     db.commit()
 
@@ -316,12 +332,9 @@ def generate_speech(
     voice_name_for_log = voice_id
     lang = language or DEFAULT_LANGUAGE
 
-    # ---- Case 1: Built-in preloaded voice ----
     if engine.is_builtin_voice(voice_id):
         speaker_name = engine.builtin_speakers[voice_id]
         voice_name_for_log = speaker_name
-
-    # ---- Case 2: Cloned voice from DB ----
     else:
         voice = db.query(Voice).filter(Voice.id == voice_id).first()
         if not voice:
@@ -345,7 +358,6 @@ def generate_speech(
     print(f"Mode: {'builtin' if speaker_name else 'cloned'}")
     print(f"Text Input: {text}")
 
-    # ---- Generate ----
     try:
         result = engine.generate(
             text=text,
@@ -361,7 +373,6 @@ def generate_speech(
             detail=f"TTS synthesis generation failed: {str(e)}"
         )
 
-    # ---- Save history ----
     history = GenerationHistory(
         voice_id=voice_id,
         text=text,
@@ -381,6 +392,11 @@ def generate_speech(
             "X-Voice-Name": voice_name_for_log,
             "X-Cache-Hit": str(result.get("is_cached", False)),
             "X-Generation-Time": str(result.get("time_seconds", 0)),
+            # IMPORTANT: Postman/browser ko purani audio cache karne se roko —
+            # taaki har response hamesha sahi voice_id ki fresh audio ho,
+            # kabhi bhi previous request ki stale audio serve na ho.
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Pragma": "no-cache",
         }
     )
 
