@@ -1,0 +1,13 @@
+coqui-tts
+fastapi
+uvicorn
+pyngrok
+nest-asyncio
+python-multipart
+torch
+torchaudio
+transformers==4.49.0
+sqlalchemy
+pymysql
+python-dotenv
+pydub
